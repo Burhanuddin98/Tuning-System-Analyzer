@@ -1,0 +1,14 @@
+﻿__pycache__/
+*.pyc
+*.wav
+*.flac
+*.ogg
+*.m4a
+*.mp3
+*.xlsm
+*.ods
+*.pdf
+.noise/
+.venv/
+.env
+.DS_Store
