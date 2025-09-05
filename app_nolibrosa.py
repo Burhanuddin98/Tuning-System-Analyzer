@@ -1,3 +1,4 @@
+# app.py
 from __future__ import annotations
 import base64, io, json
 import numpy as np
@@ -6,7 +7,7 @@ import soundfile as sf
 from scipy.signal import stft, find_peaks
 from tuning_generator import pack_defaults
 
-# --------------------------- Streamlit chrome ---------------------------
+# --------------------------- Streamlit UI ---------------------------
 st.set_page_config(page_title="Tuning Analyser — TRUE Spiral (Synced)", layout="wide")
 st.title("🎼 Tuning Analyser — TRUE Spiral (live, dark-neon)")
 
@@ -17,7 +18,7 @@ with st.sidebar:
     frame_stride = st.slider("Process every Nth frame", 1, 8, 3, step=1)
     fmin = st.number_input("Min freq (Hz)", 20.0, 400.0, 60.0, step=5.0)
     fmax = st.number_input("Max freq (Hz)", 500.0, 6000.0, 2200.0, step=50.0)
-    peak_db = st.slider("Peak threshold (dB)", -120, -10, -50, step=5)
+    peak_db = st.slider("Peak threshold (dB rel. global max)", -120, -10, -50, step=5)
     top_peaks = st.slider("Top peaks/frame", 2, 20, 8, step=1)
 
     st.header("Tuning Search")
@@ -33,7 +34,7 @@ with st.sidebar:
     st.header("Spiral")
     turns = st.slider("Octave span (turns)", 2, 10, 4)          # total log2 span
     bins_per_turn = st.slider("Resolution (bins/turn)", 180, 1440, 720, step=60)
-    wiggle_gain = st.slider("Ripple gain", 0.00, 0.75, 0.25, step=0.01)
+    wiggle_gain = st.slider("Ripple gain", 0.00, 1.00, 0.30, step=0.01)
     smooth_bins = st.slider("Ripple smoothing (bins)", 1, 81, 21, step=2)
     spokes = st.slider("Reference spokes (per 100¢)", 6, 36, 12, step=1)
 
@@ -55,17 +56,11 @@ def hsv_to_rgb_hex(h: float, s: float, v: float) -> str:
     else:       r,g,b = v,p,q
     return "#{:02x}{:02x}{:02x}".format(int(r*255), int(g*255), int(b*255))
 
-def audio_bytes_to_data_uri(data: bytes, mime: str) -> str:
-    b64 = base64.b64encode(data).decode('ascii')
-    return f"data:{mime};base64,{b64}"
-
-def reencode_to_wav_if_needed(raw: bytes, mime: str):
-    # Browsers may not play FLAC/OGG/MP3 reliably. Ensure a widely supported WAV for the <audio>.
-    supported = {"audio/wav","audio/x-wav","audio/wave","audio/ogg","audio/mpeg"}
-    if mime in supported:
-        return raw, mime
+def to_wav_bytes(raw: bytes) -> tuple[bytes, str]:
+    """Decode with soundfile and return WAV bytes (mono if needed)."""
     y, sr = sf.read(io.BytesIO(raw), dtype='float32', always_2d=False)
-    if y.ndim > 1: y = np.mean(y, axis=1)
+    if isinstance(y, np.ndarray) and y.ndim > 1:
+        y = np.mean(y, axis=1)
     buf = io.BytesIO()
     sf.write(buf, y, sr, format="WAV")
     return buf.getvalue(), "audio/wav"
@@ -136,57 +131,56 @@ def coarse_to_fine(obs_freqs, obs_mags, systems_dict, a4_lo, a4_hi, step_coarse,
     results.sort(key=lambda x: x["mad_cents"])
     return results
 
-# --------------------------- Spiral generation ---------------------------
-# Perfect Archimedean backbone; per-frame "ripples" from spectral energy
+# --------------------------- Spiral (colored, rippling line) ---------------------------
 def build_ripple_spiral_for_frame(peaks_f, peaks_m, a4_ref, span_turns, bins_per_turn, wiggle_gain, smooth_bins):
+    """
+    Build a perfect Archimedean spiral backbone, then add a small radius
+    modulation ('ripples') driven by per-frame energy along log-frequency.
+    """
     half = span_turns/2.0
     phi_grid = np.linspace(-half, +half, int(bins_per_turn*span_turns), endpoint=False)  # continuous log2 axis
 
-    # energy along phi from peaks
     energy = np.zeros_like(phi_grid)
     if peaks_f.size:
         phi_peaks = np.log2(peaks_f / a4_ref)
         w = (peaks_m - peaks_m.min()) / (peaks_m.max() - peaks_m.min() + 1e-9) + 1e-6
         keep = (phi_peaks >= -half) & (phi_peaks < half)
         phi_peaks = phi_peaks[keep]; w = w[keep]
-        bins = len(phi_grid)
-        idx = np.floor((phi_peaks + half) / (span_turns) * bins).astype(int)
-        idx = np.clip(idx, 0, bins-1)
-        np.add.at(energy, idx, w)
-        # smooth
-        if smooth_bins > 1:
-            ker = np.hanning(smooth_bins); ker /= ker.sum()
-            pad = smooth_bins//2
-            e = np.r_[energy[-pad:], energy, energy[:pad]]
-            e = np.convolve(e, ker, mode='same')
-            energy = e[pad:-pad]
-        if energy.max() > 0: energy = energy / (energy.max() + 1e-9)
+        if phi_peaks.size:
+            bins = len(phi_grid)
+            idx = np.floor((phi_peaks + half) / (span_turns) * bins).astype(int)
+            idx = np.clip(idx, 0, bins-1)
+            np.add.at(energy, idx, w)
+            if smooth_bins > 1:
+                ker = np.hanning(smooth_bins); ker /= ker.sum()
+                pad = smooth_bins//2
+                e = np.r_[energy[-pad:], energy, energy[:pad]]
+                e = np.convolve(e, ker, mode='same')
+                energy = e[pad:-pad]
+            if energy.max() > 0: energy = energy / (energy.max() + 1e-9)
 
     # Base radius + ripple
     r_base = phi_grid + half + 0.25
     r = r_base + wiggle_gain * energy
     theta = 2*np.pi * phi_grid
     x = r * np.cos(theta); y = r * np.sin(theta)
-    return x, y, phi_grid, r.max()
+    return x, y, phi_grid, r.max(), half
 
 def colored_line_segments(x, y, phi_grid, max_segments=220):
     """
-    Plotly can't color a single line per-vertex, so we break into short segments
-    and color each segment by the hue of its central pitch class.
-    We cap the number of segments for performance.
+    Plotly lacks per-vertex line coloring; split into short segments
+    and color each by pitch-class hue (from phi % 1).
     """
     n = len(phi_grid)
     if n < 4:
         return []
-
-    # Choose chunk size to keep number of segments under max_segments
     chunks = max(1, min(n//2, int(np.ceil(n / max_segments))))
     traces = []
     for i in range(0, n-1, chunks):
         j = min(n-1, i+chunks)
         xx = x[i:j+1]; yy = y[i:j+1]
         phi_mid = 0.5*(phi_grid[i] + phi_grid[j])
-        hue = (phi_mid % 1.0 + 1.0) % 1.0  # pitch class hue
+        hue = (phi_mid % 1.0 + 1.0) % 1.0
         col = hsv_to_rgb_hex(hue, 0.95, 0.95)
         traces.append(dict(
             type='scatter', mode='lines',
@@ -200,17 +194,21 @@ def make_plotly_frames_sync(times, peaks_f_list, peaks_m_list,
                             a4_ref, span_turns, bins_per_turn, wiggle_gain, smooth_bins, spokes):
     frames = []
 
-    # Precompute static guides extents
-    # use first frame to size the view
-    x0, y0, phi0, rmax0 = build_ripple_spiral_for_frame(
-        peaks_f_list[0] if len(peaks_f_list) else np.array([]),
-        peaks_m_list[0] if len(peaks_m_list) else np.array([]),
-        a4_ref, span_turns, bins_per_turn, wiggle_gain, smooth_bins
-    )
-    half = span_turns/2.0
-    Rmax = (np.max(np.sqrt(x0**2 + y0**2)) if x0.size else (half + 0.25)) + 0.75
+    # size view using an initial frame (or backbone)
+    if len(peaks_f_list):
+        x0, y0, phi0, _, half = build_ripple_spiral_for_frame(
+            peaks_f_list[0], peaks_m_list[0],
+            a4_ref, span_turns, bins_per_turn, wiggle_gain, smooth_bins
+        )
+    else:
+        half = span_turns/2.0
+        phi0 = np.linspace(-half, +half, int(bins_per_turn*span_turns), endpoint=False)
+        r0 = phi0 + half + 0.25
+        theta0 = 2*np.pi*phi0
+        x0 = r0*np.cos(theta0); y0 = r0*np.sin(theta0)
+    Rmax = float(np.max(np.sqrt(x0**2 + y0**2)) + 0.75)
 
-    # Static guides: spokes & octave circles
+    # guides: spokes & octave circles
     traces_guides = []
     for s in range(spokes):
         ang = 2*np.pi * s / spokes
@@ -231,17 +229,13 @@ def make_plotly_frames_sync(times, peaks_f_list, peaks_m_list,
             hoverinfo='skip', showlegend=False
         ))
 
-    # Build a frame for each STFT time: just the colored ripple line (no dots)
+    # frames = guides + colored ripple line (no dots)
     for pf, pm in zip(peaks_f_list, peaks_m_list):
-        x, y, phi, _ = build_ripple_spiral_for_frame(pf, pm, a4_ref, span_turns, bins_per_turn, wiggle_gain, smooth_bins)
+        x, y, phi, _, _ = build_ripple_spiral_for_frame(pf, pm, a4_ref, span_turns, bins_per_turn, wiggle_gain, smooth_bins)
         segs = colored_line_segments(x, y, phi, max_segments=220)
-        frames.append(dict(
-            name="",
-            data=traces_guides + segs
-        ))
+        frames.append(dict(name="", data=traces_guides + segs))
 
     init = frames[0]['data'] if frames else traces_guides
-
     return dict(
         data=init,
         layout=dict(
@@ -251,15 +245,14 @@ def make_plotly_frames_sync(times, peaks_f_list, peaks_m_list,
             xaxis=dict(visible=False, range=[-Rmax, Rmax]),
             yaxis=dict(visible=False, range=[-Rmax, Rmax], scaleanchor='x', scaleratio=1),
             margin=dict(l=10, r=10, t=40, b=10),
-            title="TRUE Spiral — angle: pitch class • radius: octaves (line color = pitch class; ripple = energy)"
+            title="TRUE Spiral — angle: pitch class • radius: octaves (colored; ripples = energy)"
         ),
         frames=[dict(name=str(i), data=f['data']) for i, f in enumerate(frames)]
     )
 
-# --------------------------- Main flow ---------------------------
+# --------------------------- Main ---------------------------
 if uploaded is not None:
     raw_in = uploaded.read()
-    src_mime = uploaded.type
     # decode for analysis
     try:
         y, sr = sf.read(io.BytesIO(raw_in), dtype='float32', always_2d=False)
@@ -267,12 +260,11 @@ if uploaded is not None:
     except Exception as e:
         st.error(f"Decode failed: {e}"); st.stop()
 
-    # peaks
     times, pf, pm, all_f, all_m = extract_frame_peaks(
         y, sr, frame_ms, hop_ms, frame_stride, fmin, fmax, top_peaks, peak_db
     )
     if all_f.size == 0:
-        st.warning("No usable peaks detected."); st.stop()
+        st.warning("No usable peaks detected in the selected band/threshold."); st.stop()
 
     # tuning
     best = coarse_to_fine(all_f, all_m, systems, a4_lo, a4_hi, a4_step_coarse, a4_step_fine, fine_span_hz)
@@ -285,12 +277,12 @@ if uploaded is not None:
     fig_spec = make_plotly_frames_sync(times, pf, pm, a4_ref, turns, bins_per_turn, wiggle_gain, smooth_bins, spokes)
     fig_json = json.dumps(fig_spec)
 
-    # prepare audio for browser playback (re-encode if needed)
-    raw_out, out_mime = reencode_to_wav_if_needed(raw_in, src_mime)
-    audio_uri = audio_bytes_to_data_uri(raw_out, out_mime)
+    # reliable audio in iframe: always WAV → base64 → Blob URL in JS
+    wav_bytes, _ = to_wav_bytes(raw_in)
+    audio_b64 = base64.b64encode(wav_bytes).decode('ascii')
     times_list = times.tolist()
 
-    # HTML with binary-search sync; IMPORTANT: Plotly.animate(plotDiv, String(idx), ...)
+    # HTML + JS (Blob audio, binary-search sync, correct animate)
     st.components.v1.html(f"""
     <html>
     <head>
@@ -306,21 +298,38 @@ if uploaded is not None:
     <body>
       <div class="wrap">
         <div id="plot"></div>
-        <audio id="aud" src="{audio_uri}" controls></audio>
+        <audio id="aud" controls preload="auto"></audio>
       </div>
       <script>
         const spec = {fig_json};
         const times = {json.dumps(times_list)};
         const N = times.length;
 
+        // Rebuild WAV from base64, use Blob URL (reliable inside iframes)
+        const b64 = "{audio_b64}";
+        function b64ToBlob(b64Data, contentType) {{
+          const byteChars = atob(b64Data);
+          const byteNums = new Array(byteChars.length);
+          for (let i = 0; i < byteChars.length; i++) byteNums[i] = byteChars.charCodeAt(i);
+          const byteArray = new Uint8Array(byteNums);
+          return new Blob([byteArray], {{ type: "audio/wav" }});
+        }}
+        const aud = document.getElementById('aud');
+        try {{
+          const blob = b64ToBlob(b64, "audio/wav");
+          const url = URL.createObjectURL(blob);
+          aud.src = url;
+        }} catch (e) {{
+          console.error("Audio blob creation failed:", e);
+        }}
+
+        // Plotly init
         const plotDiv = document.getElementById('plot');
         Plotly.newPlot(plotDiv, spec.data, spec.layout).then(() => {{
           Plotly.addFrames(plotDiv, spec.frames);
         }});
 
-        const aud = document.getElementById('aud');
-        let rafId = null;
-
+        // Fast nearest index (binary search)
         function nearestIdx(arr, t) {{
           let lo = 0, hi = arr.length - 1;
           while (lo <= hi) {{
@@ -332,6 +341,8 @@ if uploaded is not None:
           return (Math.abs(arr[lo] - t) < Math.abs(arr[lo - 1] - t)) ? lo : (lo - 1);
         }}
 
+        // Animation loop (frame-accurate)
+        let rafId = null;
         function step() {{
           if (!aud.paused && N > 0) {{
             const idx = nearestIdx(times, aud.currentTime);
@@ -346,6 +357,7 @@ if uploaded is not None:
         aud.addEventListener('play',  () => {{ if (!rafId) step(); }});
         aud.addEventListener('pause', () => {{ if (rafId) cancelAnimationFrame(rafId); rafId = null; }});
         aud.addEventListener('ended', () => {{ if (rafId) cancelAnimationFrame(rafId); rafId = null; }});
+        aud.addEventListener('error', (e) => {{ console.error("Audio error:", e); }});
       </script>
     </body>
     </html>
