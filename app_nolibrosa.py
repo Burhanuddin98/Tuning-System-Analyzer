@@ -16,21 +16,25 @@ with st.sidebar:
     bins_per_turn = st.slider("Resolution (bins/turn)", 180, 1440, 720, step=60)
     spokes = st.slider("Reference spokes (per 100¢)", 6, 36, 12, step=1)
 
-    st.subheader("Ripple Controls")
-    wiggle_gain = st.slider("Ripple Gain (×)", 0.00, 2.00, 0.60, step=0.01)
+    st.subheader("Ripple Controls (visual shape)")
+    wiggle_gain   = st.slider("Ripple Gain (×)", 0.00, 2.00, 0.60, step=0.01)
     ripple_target = st.slider("Ripple Target (radius units)", 0.00, 1.50, 0.45, step=0.01)
-    ripple_max = st.slider("Ripple Max (hard cap)", 0.05, 2.00, 0.90, step=0.05)
-    ripple_gamma = st.slider("Ripple Gamma (contrast)", 0.40, 1.60, 0.85, step=0.01)
-    smooth_bins = st.slider("Ripple Smoothing (bins)", 1, 81, 21, step=2)
-    max_segments = st.slider("Colored line segments", 40, 400, 180, step=20)
+    ripple_max    = st.slider("Ripple Max (hard cap)", 0.05, 2.00, 0.90, step=0.05)
+    ripple_gamma  = st.slider("Ripple Gamma (contrast)", 0.40, 1.60, 0.85, step=0.01)
+    smooth_bins   = st.slider("Ripple Smoothing (bins)", 1, 81, 21, step=2)
 
-    st.header("WebAudio Analyser")
+    st.subheader("Cardiogram Feel")
+    ripple_temporal_cutoff = st.slider("Ripple Temporal Cutoff (Hz)", 0.2, 12.0, 3.0, step=0.1)
+    line_width    = st.slider("Spiral Line Width", 1, 6, 3, step=1)
+    max_segments  = st.slider("Colored Line Segments", 60, 500, 300, step=20)
+
+    st.header("WebAudio Analyser (live)")
     fmin = st.number_input("Min freq (Hz)", 20.0, 400.0, 60.0, step=5.0)
     fmax = st.number_input("Max freq (Hz)", 500.0, 12000.0, 2200.0, step=50.0)
     peak_db = st.slider("Magnitude threshold (dBFS)", -120, -10, -80, step=2)
     fft_size = st.selectbox("FFT size", [2048, 4096, 8192, 16384], index=1)  # 4096
     target_fps = st.slider("Target FPS", 10, 60, 30, step=5)
-    smoothing_tc = st.slider("Temporal Smoothing (0..1)", 0.0, 0.95, 0.50, step=0.01)
+    smoothing_tc = st.slider("WebAudio temporal smoothing (0..1)", 0.0, 0.95, 0.50, step=0.01)
 
     st.header("Tuning Readout (server-side one-shot)")
     systems_all = pack_defaults()
@@ -45,11 +49,12 @@ with st.sidebar:
 systems = {k: systems_all[k] for k in choose} if len(choose)>0 else systems_all
 uploaded = st.file_uploader("Upload audio (WAV/FLAC/OGG/MP3)", type=["wav","flac","ogg","mp3"])
 
-# --------------------------- Server-side helpers (readout only) ---------------------------
+# --------------------------- Helpers (server-side) ---------------------------
 def amplitude_to_db(x, ref=1.0, amin=1e-12):
     x = np.maximum(x, amin); return 20.0 * np.log10(x / ref)
 
 def extract_global_peaks(y, sr, fmin, fmax, peak_db):
+    # coarse peaks for tuning estimation: one medium STFT + gather top peaks across frames
     from scipy.signal import stft, find_peaks
     nperseg = int(sr*0.064)
     hop = int(sr*0.024)
@@ -127,14 +132,13 @@ def to_wav_b64(raw: bytes) -> str:
 if uploaded is not None:
     raw_in = uploaded.read()
 
-    # decode once for readout (optional)
+    # server-side tuning readout (one-shot; visualization is live in JS)
     try:
         y, sr = sf.read(io.BytesIO(raw_in), dtype='float32', always_2d=False)
         if y.ndim > 1: y = np.mean(y, axis=1)
     except Exception as e:
         st.error(f"Decode failed: {e}"); st.stop()
 
-    # server-side tuning readout (one-shot)
     all_f, all_m = extract_global_peaks(y, sr, fmin, fmax, peak_db)
     if all_f.size == 0:
         st.warning("No usable peaks detected for tuning readout; the realtime plot will still work.")
@@ -148,7 +152,7 @@ if uploaded is not None:
     for i, r in enumerate(best, 1):
         st.markdown(f"**{i}. {r['name']}** — A4 ≈ **{r['a4']:.2f} Hz**, tonic offset **{r['offset']:.1f}¢**, error ≈ **{r['mad_cents']:.1f}¢**")
 
-    # spiral grid (shared to JS)
+    # Spiral grid & segments (sent to JS)
     span_turns = int(turns)
     bins_total = int(bins_per_turn * span_turns)
     half = span_turns / 2.0
@@ -158,7 +162,6 @@ if uploaded is not None:
     x0 = r_base*np.cos(theta0); y0 = r_base*np.sin(theta0)
     Rmax = float(np.max(np.sqrt(x0**2 + y0**2)) + 0.75)
 
-    # segment breaks for colored line (stable across frames)
     chunks = max(1, min(len(phi_grid)//2, int(np.ceil(len(phi_grid) / max_segments))))
     seg_indices = []
     i = 0
@@ -167,7 +170,6 @@ if uploaded is not None:
         seg_indices.append((i, j))
         i = j
 
-    # parameters to JS
     params = dict(
         phi_grid=phi_grid.tolist(),
         r_base=r_base.tolist(),
@@ -187,6 +189,8 @@ if uploaded is not None:
         ripple_gamma=float(ripple_gamma),
         ripple_target=float(ripple_target),
         ripple_max=float(ripple_max),
+        ripple_fc=float(ripple_temporal_cutoff),
+        line_w=int(line_width),
     )
 
     audio_b64 = to_wav_b64(raw_in)
@@ -233,11 +237,13 @@ if uploaded is not None:
         const PKDB     = P.peak_db;
         const FFTSIZE  = P.fft_size|0;
         const TARGET_FPS = P.target_fps|0;
-        const SMOOTH_TC = P.smoothing_tc;
+        const SMOOTH_TC = Math.min(0.5, Math.max(0.0, P.smoothing_tc)); // cap @ 0.5 (we do our own LPF)
         const A4       = P.a4_ref;
         const RIP_GAM  = P.ripple_gamma;
         const RIP_TGT  = P.ripple_target;
         const RIP_MAX  = P.ripple_max;
+        const RIP_FC   = Math.max(0.01, P.ripple_fc);
+        const LINE_W   = P.line_w|0;
 
         // ----- Audio: rebuild WAV blob -----
         const b64 = "{audio_b64}";
@@ -260,7 +266,7 @@ if uploaded is not None:
         const src = AC.createMediaElementSource(aud);
         const analyser = AC.createAnalyser();
         analyser.fftSize = FFTSIZE;
-        analyser.smoothingTimeConstant = Math.max(0, Math.min(0.95, SMOOTH_TC));
+        analyser.smoothingTimeConstant = SMOOTH_TC;
         src.connect(analyser);
         analyser.connect(AC.destination);
 
@@ -299,34 +305,7 @@ if uploaded is not None:
         const theta = new Float64Array(phi_grid.length);
         for (let i=0;i<phi_grid.length;i++) theta[i] = 2*Math.PI*phi_grid[i];
 
-        // precreate colored line segments
-        const segStart = traces.length;
-        for (const [i,j] of seg_idx) {{
-          const mid = 0.5*(phi_grid[i] + phi_grid[j]);
-          const hue = ((mid % 1)+1)%1;
-          const col = hsvToRgbHex(hue, 0.95, 0.95);
-          traces.push({{
-            type:'scatter', mode:'lines',
-            x: new Array(j-i+1).fill(0),
-            y: new Array(j-i+1).fill(0),
-            line: {{ width: 2, color: col }},
-            hoverinfo:'skip', showlegend:false
-          }});
-        }}
-
-        const layout = {{
-          template:'plotly_dark',
-          paper_bgcolor:'#0a0a0a',
-          plot_bgcolor:'#0a0a0a',
-          xaxis:{{ visible:false, range:[-Rmax, Rmax] }},
-          yaxis:{{ visible:false, range:[-Rmax, Rmax], scaleanchor:'x', scaleratio:1 }},
-          margin:{{ l:10, r:10, t:40, b:10 }},
-          title:"TRUE Spiral — angle: pitch class • radius: octaves (colored; LIVE ripples)",
-        }};
-        const plotDiv = document.getElementById('plot');
-        Plotly.newPlot(plotDiv, traces, layout);
-
-        // ----- Utils -----
+        // precreate colored line segments (line itself is colored; no dots)
         function hsvToRgbHex(h, s, v) {{
           const i = Math.floor(h*6)%6, f = h*6 - i;
           const p = v*(1-s), q = v*(1-f*s), t = v*(1-(1-f)*s);
@@ -340,6 +319,34 @@ if uploaded is not None:
           const R=(r*255)|0, G=(g*255)|0, B=(b*255)|0;
           return "#" + R.toString(16).padStart(2,'0') + G.toString(16).padStart(2,'0') + B.toString(16).padStart(2,'0');
         }}
+
+        const segStart = traces.length;
+        for (const [i,j] of seg_idx) {{
+          const mid = 0.5*(phi_grid[i] + phi_grid[j]);
+          const hue = ((mid % 1)+1)%1;
+          const col = hsvToRgbHex(hue, 0.95, 0.95);
+          traces.push({{
+            type:'scatter', mode:'lines',
+            x: new Array(j-i+1).fill(0),
+            y: new Array(j-i+1).fill(0),
+            line: {{ width: LINE_W, color: col }},
+            hoverinfo:'skip', showlegend:false
+          }});
+        }}
+
+        const layout = {{
+          template:'plotly_dark',
+          paper_bgcolor:'#0a0a0a',
+          plot_bgcolor:'#0a0a0a',
+          xaxis:{{ visible:false, range:[-Rmax, Rmax] }},
+          yaxis:{{ visible:false, range:[-Rmax, Rmax], scaleanchor:'x', scaleratio:1 }},
+          margin:{{ l:10, r:10, t:40, b:10 }},
+          title:"TRUE Spiral — angle: pitch class • radius: octaves (colored; LIVE cardiogram ripples)",
+        }};
+        const plotDiv = document.getElementById('plot');
+        Plotly.newPlot(plotDiv, traces, layout);
+
+        // circular moving average (we'll apply twice ≈ Gaussian)
         function smoothCircular(arr, win) {{
           if (win<=1) return arr.slice();
           const n = arr.length, pad = Math.floor(win/2), out = new Float64Array(n);
@@ -353,16 +360,16 @@ if uploaded is not None:
           return Array.from(out);
         }}
 
-        // working buffers
         const x = new Float64Array(phi_grid.length);
         const y = new Float64Array(phi_grid.length);
-
-        // ----- Live update loop -----
         let lastTS = 0;
+
         function tick(ts) {{
-          const minDt = 1000/Math.max(10, TARGET_FPS);
+          // FPS throttle
           if (!lastTS) lastTS = ts;
-          if (ts - lastTS < minDt) {{ requestAnimationFrame(tick); return; }}
+          const dt = (ts - lastTS) / 1000.0;
+          const minDt = 1.0 / Math.max(10, TARGET_FPS);
+          if (dt < minDt) {{ requestAnimationFrame(tick); return; }}
           lastTS = ts;
 
           if (!aud.paused) {{
@@ -390,31 +397,41 @@ if uploaded is not None:
             let scale = p95 - med; if (scale <= 1e-12) scale = 1e-12;
             for (let i=0;i<energy.length;i++) energy[i] = (energy[i] - med) / scale;
 
-            // --- GAMMA ---
-            const GAM = RIP_GAM;
-            if (Math.abs(GAM - 1.0) > 1e-6) {{
-              for (let i=0;i<energy.length;i++) {{
-                const s = Math.sign(energy[i]), a = Math.abs(energy[i]);
-                energy[i] = s * Math.pow(a, GAM);
+            // --- TEMPORAL LOW-PASS (one-pole; cardiogram feel) ---
+            const alpha = 1 - Math.exp(-2*Math.PI*RIP_FC*dt);
+            if (!window._energyLP || window._energyLP.length !== energy.length) {{
+              window._energyLP = new Float64Array(energy.length);
+            }}
+            const energyLP = window._energyLP;
+            for (let i=0;i<energy.length;i++) {{
+              energyLP[i] += alpha * (energy[i] - energyLP[i]);
+            }}
+
+            // --- GAMMA (contrast) ---
+            if (Math.abs(RIP_GAM - 1.0) > 1e-6) {{
+              for (let i=0;i<energyLP.length;i++) {{
+                const s = Math.sign(energyLP[i]), a = Math.abs(energyLP[i]);
+                energyLP[i] = s * Math.pow(a, RIP_GAM);
               }}
             }}
 
-            // --- SMOOTH ---
-            const energySm = (SMOOTH > 1) ? smoothCircular(Array.from(energy), SMOOTH) : Array.from(energy);
+            // --- DOUBLE SPATIAL SMOOTH (≈ Gaussian) ---
+            const sm1 = (SMOOTH > 1) ? smoothCircular(Array.from(energyLP), SMOOTH) : Array.from(energyLP);
+            const energySm = (SMOOTH > 1) ? smoothCircular(sm1, SMOOTH) : sm1;
 
-            // --- ZERO-CENTER ---
+            // --- ZERO-CENTER (no radial drift) ---
             let mean = 0; for (let i=0;i<energySm.length;i++) mean += energySm[i];
             mean /= energySm.length;
             for (let i=0;i<energySm.length;i++) energySm[i] -= mean;
 
-            // --- AUTO-GAIN + CAP ---
+            // --- AUTO-GAIN + CLAMP ---
             let rms = 0; for (let i=0;i<energySm.length;i++) rms += energySm[i]*energySm[i];
             rms = Math.sqrt(rms / energySm.length);
             let gain = (rms > 1e-9) ? (RIP_TGT / rms) : 0.0;
             gain *= Math.max(0.0, WGAIN);
             const RCLAMP = Math.max(0.01, RIP_MAX);
 
-            // coords
+            // --- NEW COORDS ---
             for (let i=0;i<phi_grid.length;i++) {{
               const dr = Math.max(-RCLAMP, Math.min(RCLAMP, gain * energySm[i]));
               const r = r_base[i] + dr;
@@ -422,7 +439,7 @@ if uploaded is not None:
               y[i] = r * Math.sin(theta[i]);
             }}
 
-            // update only the colored segments
+            // --- UPDATE ONLY SEGMENTS (line is colored; no dots) ---
             const updateX = [], updateY = [], idxs = [];
             for (let s=0; s<seg_idx.length; s++) {{
               const [i0, j0] = seg_idx[s];
@@ -436,7 +453,7 @@ if uploaded is not None:
         }}
         requestAnimationFrame(tick);
 
-        // Buttons (resume AudioContext if needed)
+        // Controls
         document.getElementById('play').addEventListener('click', async () => {{
           try {{ if (AC.state === 'suspended') await AC.resume(); aud.play(); }} catch(e){{ console.error(e); }}
         }});
@@ -446,4 +463,4 @@ if uploaded is not None:
     </html>
     """, height=720)
 else:
-    st.info("Upload audio to see a realtime, colored spiral with controllable ripples.")
+    st.info("Upload audio to see a realtime, colored spiral with **cardiogram-smooth** ripples.")
