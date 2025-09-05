@@ -4,15 +4,35 @@ import base64, io, json
 import numpy as np
 import streamlit as st
 import soundfile as sf
-from scipy.signal import stft, find_peaks
 from tuning_generator import pack_defaults
 
 # --------------------------- Streamlit UI ---------------------------
-st.set_page_config(page_title="Tuning Analyser — TRUE Spiral (Synced, REAL-TIME)", layout="wide")
-st.title("🎼 Tuning Analyser — TRUE Spiral (REAL-TIME, dark-neon)")
+st.set_page_config(page_title="Tuning Analyser — TRUE Spiral (Realtime)", layout="wide")
+st.title("🎼 Tuning Analyser — TRUE Spiral (Realtime, dark-neon)")
 
 with st.sidebar:
-    st.header("Tuning Search (server-side, for readout)")
+    st.header("Realtime Spiral")
+    turns = st.slider("Octave span (turns)", 2, 10, 4)
+    bins_per_turn = st.slider("Resolution (bins/turn)", 180, 1440, 720, step=60)
+    spokes = st.slider("Reference spokes (per 100¢)", 6, 36, 12, step=1)
+
+    st.subheader("Ripple Controls")
+    wiggle_gain = st.slider("Ripple Gain (×)", 0.00, 2.00, 0.60, step=0.01)
+    ripple_target = st.slider("Ripple Target (radius units)", 0.00, 1.50, 0.45, step=0.01)
+    ripple_max = st.slider("Ripple Max (hard cap)", 0.05, 2.00, 0.90, step=0.05)
+    ripple_gamma = st.slider("Ripple Gamma (contrast)", 0.40, 1.60, 0.85, step=0.01)
+    smooth_bins = st.slider("Ripple Smoothing (bins)", 1, 81, 21, step=2)
+    max_segments = st.slider("Colored line segments", 40, 400, 180, step=20)
+
+    st.header("WebAudio Analyser")
+    fmin = st.number_input("Min freq (Hz)", 20.0, 400.0, 60.0, step=5.0)
+    fmax = st.number_input("Max freq (Hz)", 500.0, 12000.0, 2200.0, step=50.0)
+    peak_db = st.slider("Magnitude threshold (dBFS)", -120, -10, -80, step=2)
+    fft_size = st.selectbox("FFT size", [2048, 4096, 8192, 16384], index=1)  # 4096
+    target_fps = st.slider("Target FPS", 10, 60, 30, step=5)
+    smoothing_tc = st.slider("Temporal Smoothing (0..1)", 0.0, 0.95, 0.50, step=0.01)
+
+    st.header("Tuning Readout (server-side one-shot)")
     systems_all = pack_defaults()
     default_keys = ["12-EDO","Pythagorean_12","Meantone_12_0.25comma","JI_5limit_chromatic_12"]
     choose = st.multiselect("Systems to test", list(systems_all.keys()), default=default_keys)
@@ -22,31 +42,14 @@ with st.sidebar:
     a4_step_fine   = st.number_input("A4 fine step (Hz)", 0.05, 1.0, 0.1, step=0.05)
     fine_span_hz   = st.number_input("A4 fine ± span (Hz)", 0.5, 5.0, 2.0, step=0.5)
 
-    st.header("Spiral (visual realtime)")
-    turns = st.slider("Octave span (turns)", 2, 10, 4)          # total log2 span
-    bins_per_turn = st.slider("Resolution (bins/turn)", 180, 1440, 720, step=60)
-    spokes = st.slider("Reference spokes (per 100¢)", 6, 36, 12, step=1)
-    wiggle_gain = st.slider("Ripple gain", 0.00, 1.00, 0.30, step=0.01)
-    smooth_bins = st.slider("Ripple smoothing (bins)", 1, 81, 21, step=2)
-    max_segments = st.slider("Colored line segments", 40, 400, 160, step=20)
-
-    st.header("Realtime spectrum")
-    fmin = st.number_input("Min freq (Hz)", 20.0, 400.0, 60.0, step=5.0)
-    fmax = st.number_input("Max freq (Hz)", 500.0, 12000.0, 2200.0, step=50.0)
-    peak_db = st.slider("Magnitude threshold (dB, analyser)", -120, -10, -70, step=2)
-    fft_size = st.selectbox("FFT size (WebAudio)", [2048, 4096, 8192, 16384], index=1)  # 4096 default
-    target_fps = st.slider("Target FPS", 10, 60, 30, step=5)
-
 systems = {k: systems_all[k] for k in choose} if len(choose)>0 else systems_all
-
 uploaded = st.file_uploader("Upload audio (WAV/FLAC/OGG/MP3)", type=["wav","flac","ogg","mp3"])
 
-# --------------------------- Server-side helpers (for readout only) ---------------------------
+# --------------------------- Server-side helpers (readout only) ---------------------------
 def amplitude_to_db(x, ref=1.0, amin=1e-12):
     x = np.maximum(x, amin); return 20.0 * np.log10(x / ref)
 
-def extract_global_peaks(y, sr, fmin, fmax):
-    # coarse peaks for tuning estimation: one big STFT and all peaks gathered
+def extract_global_peaks(y, sr, fmin, fmax, peak_db):
     from scipy.signal import stft, find_peaks
     nperseg = int(sr*0.064)
     hop = int(sr*0.024)
@@ -64,12 +67,10 @@ def extract_global_peaks(y, sr, fmin, fmax):
         if pk.size == 0: continue
         h = props["peak_heights"]
         sel = np.argsort(h)[-12:][::-1]
-        all_f.append(fbin[pk[sel]])
-        all_m.append(h[sel])
+        all_f.append(fbin[pk[sel]]); all_m.append(h[sel])
     if all_f:
         return np.concatenate(all_f), np.concatenate(all_m)
-    else:
-        return np.array([]), np.array([])
+    return np.array([]), np.array([])
 
 def score_system(obs_freqs, obs_mags, cents_grid, a4_ref):
     obs_pc = (1200.0 * np.log2(obs_freqs / a4_ref)) % 1200.0
@@ -83,7 +84,7 @@ def score_system(obs_freqs, obs_mags, cents_grid, a4_ref):
         order = np.argsort(dmin)
         w_sorted = w[order]; d_sorted = dmin[order]
         cumw = np.cumsum(w_sorted)
-        med_idx = np.searchsorted(cumw, cumw[-1]/2.0)
+        med_idx = np.searchsorted(cumw, cumw[-1] / 2.0)
         mad = d_sorted[min(med_idx, len(d_sorted)-1)]
         if mad < best[0]: best = (float(mad), float(off))
     return {"offset": best[1], "mad_cents": best[0]}
@@ -125,36 +126,39 @@ def to_wav_b64(raw: bytes) -> str:
 # --------------------------- Main ---------------------------
 if uploaded is not None:
     raw_in = uploaded.read()
+
+    # decode once for readout (optional)
     try:
         y, sr = sf.read(io.BytesIO(raw_in), dtype='float32', always_2d=False)
         if y.ndim > 1: y = np.mean(y, axis=1)
     except Exception as e:
         st.error(f"Decode failed: {e}"); st.stop()
 
-    # Server-side tuning readout (one-shot)
-    all_f, all_m = extract_global_peaks(y, sr, fmin, fmax)
+    # server-side tuning readout (one-shot)
+    all_f, all_m = extract_global_peaks(y, sr, fmin, fmax, peak_db)
     if all_f.size == 0:
         st.warning("No usable peaks detected for tuning readout; the realtime plot will still work.")
-        # pick a reasonable A4 fallback
-        a4_guess = 440.0
-        best = [{"name": "12-EDO", "a4": a4_guess, "offset": 0.0, "mad_cents": 100.0}]
+        a4_ref = 440.0
+        best = [{"name": "12-EDO", "a4": a4_ref, "offset": 0.0, "mad_cents": 100.0}]
     else:
         best = coarse_to_fine(all_f, all_m, systems, a4_lo, a4_hi, a4_step_coarse, a4_step_fine, fine_span_hz)
+        a4_ref = float(best[0]["a4"])
 
     st.subheader("Best tuning matches")
     for i, r in enumerate(best, 1):
         st.markdown(f"**{i}. {r['name']}** — A4 ≈ **{r['a4']:.2f} Hz**, tonic offset **{r['offset']:.1f}¢**, error ≈ **{r['mad_cents']:.1f}¢**")
-    a4_ref = float(best[0]["a4"])
 
-    # Build spiral phi grid on the server (shared to JS)
+    # spiral grid (shared to JS)
     span_turns = int(turns)
     bins_total = int(bins_per_turn * span_turns)
     half = span_turns / 2.0
     phi_grid = np.linspace(-half, +half, bins_total, endpoint=False).astype(float)
     r_base = phi_grid + half + 0.25
+    theta0 = 2.0*np.pi*phi_grid
+    x0 = r_base*np.cos(theta0); y0 = r_base*np.sin(theta0)
+    Rmax = float(np.max(np.sqrt(x0**2 + y0**2)) + 0.75)
 
-    # Precompute segment breaks for colored line (keep stable across frames)
-    # Split into <= max_segments traces
+    # segment breaks for colored line (stable across frames)
     chunks = max(1, min(len(phi_grid)//2, int(np.ceil(len(phi_grid) / max_segments))))
     seg_indices = []
     i = 0
@@ -163,13 +167,7 @@ if uploaded is not None:
         seg_indices.append((i, j))
         i = j
 
-    # Static guides (in JS) need geometry extents
-    # Estimate Rmax
-    theta0 = 2.0*np.pi*phi_grid
-    x0 = r_base*np.cos(theta0); y0 = r_base*np.sin(theta0)
-    Rmax = float(np.max(np.sqrt(x0**2 + y0**2)) + 0.75)
-
-    # Pack parameters to inject into the HTML
+    # parameters to JS
     params = dict(
         phi_grid=phi_grid.tolist(),
         r_base=r_base.tolist(),
@@ -184,11 +182,16 @@ if uploaded is not None:
         peak_db=float(peak_db),
         fft_size=int(fft_size),
         target_fps=int(target_fps),
+        smoothing_tc=float(smoothing_tc),
         a4_ref=float(a4_ref),
+        ripple_gamma=float(ripple_gamma),
+        ripple_target=float(ripple_target),
+        ripple_max=float(ripple_max),
     )
 
     audio_b64 = to_wav_b64(raw_in)
 
+    # --------------------------- HTML + JS (Realtime) ---------------------------
     st.components.v1.html(f"""
     <html>
     <head>
@@ -213,12 +216,13 @@ if uploaded is not None:
           <audio id="aud" controls preload="auto" style="flex:1"></audio>
         </div>
       </div>
+
       <script>
         // ----- Parameters from Python -----
         const P = {json.dumps(params)};
         const phi_grid = Float64Array.from(P.phi_grid);
         const r_base   = Float64Array.from(P.r_base);
-        const seg_idx  = P.seg_idx; // [[i,j],...]
+        const seg_idx  = P.seg_idx;
         const Rmax     = P.Rmax;
         const HALF     = P.half;
         const SPOKES   = P.spokes;
@@ -229,7 +233,11 @@ if uploaded is not None:
         const PKDB     = P.peak_db;
         const FFTSIZE  = P.fft_size|0;
         const TARGET_FPS = P.target_fps|0;
+        const SMOOTH_TC = P.smoothing_tc;
         const A4       = P.a4_ref;
+        const RIP_GAM  = P.ripple_gamma;
+        const RIP_TGT  = P.ripple_target;
+        const RIP_MAX  = P.ripple_max;
 
         // ----- Audio: rebuild WAV blob -----
         const b64 = "{audio_b64}";
@@ -252,20 +260,17 @@ if uploaded is not None:
         const src = AC.createMediaElementSource(aud);
         const analyser = AC.createAnalyser();
         analyser.fftSize = FFTSIZE;
-        analyser.smoothingTimeConstant = 0.7; // mild temporal smoothing
+        analyser.smoothingTimeConstant = Math.max(0, Math.min(0.95, SMOOTH_TC));
         src.connect(analyser);
         analyser.connect(AC.destination);
 
         const bins = analyser.frequencyBinCount;
         const freqData = new Float32Array(bins);
-        // freq per bin: bin_index * sampleRate/2 / bins
-        function binFreq(i) {{
-          return (i * AC.sampleRate * 0.5) / bins;
-        }}
+        function binFreq(i) {{ return (i * AC.sampleRate * 0.5) / bins; }}
 
-        // ----- Plotly init: guides + colored segments (no dots) -----
+        // ----- Plotly init: guides + colored segments -----
         const traces = [];
-        // guides: spokes
+        // spokes
         for (let s=0; s<SPOKES; s++) {{
           const ang = 2*Math.PI * s / SPOKES;
           traces.push({{
@@ -276,13 +281,11 @@ if uploaded is not None:
             hoverinfo:'skip', showlegend:false
           }});
         }}
-        // guides: octave circles at integer phi
+        // octave circles
         for (let k=Math.floor(-HALF); k<=Math.ceil(HALF); k++) {{
-          const t = [];
           const xx = [], yy = [];
           for (let i=0;i<=360;i++) {{
-            const a = i*Math.PI/180;
-            const r = k + HALF + 0.25;
+            const a = i*Math.PI/180; const r = k + HALF + 0.25;
             xx.push(r*Math.cos(a)); yy.push(r*Math.sin(a));
           }}
           traces.push({{
@@ -292,17 +295,16 @@ if uploaded is not None:
           }});
         }}
 
-        // precompute theta for speed
+        // precompute theta
         const theta = new Float64Array(phi_grid.length);
         for (let i=0;i<phi_grid.length;i++) theta[i] = 2*Math.PI*phi_grid[i];
 
-        // create colored segment traces once; colors by pitch-class hue of segment midpoint
+        // precreate colored line segments
         const segStart = traces.length;
         for (const [i,j] of seg_idx) {{
           const mid = 0.5*(phi_grid[i] + phi_grid[j]);
-          const hue = ((mid % 1)+1)%1; // 0..1
+          const hue = ((mid % 1)+1)%1;
           const col = hsvToRgbHex(hue, 0.95, 0.95);
-          // placeholder pts
           traces.push({{
             type:'scatter', mode:'lines',
             x: new Array(j-i+1).fill(0),
@@ -326,11 +328,8 @@ if uploaded is not None:
 
         // ----- Utils -----
         function hsvToRgbHex(h, s, v) {{
-          const i = Math.floor(h*6)%6;
-          const f = h*6 - i;
-          const p = v*(1-s);
-          const q = v*(1-f*s);
-          const t = v*(1-(1-f)*s);
+          const i = Math.floor(h*6)%6, f = h*6 - i;
+          const p = v*(1-s), q = v*(1-f*s), t = v*(1-(1-f)*s);
           let r,g,b;
           if (i===0) {{ r=v; g=t; b=p; }}
           else if (i===1) {{ r=q; g=v; b=p; }}
@@ -341,66 +340,89 @@ if uploaded is not None:
           const R=(r*255)|0, G=(g*255)|0, B=(b*255)|0;
           return "#" + R.toString(16).padStart(2,'0') + G.toString(16).padStart(2,'0') + B.toString(16).padStart(2,'0');
         }}
-
         function smoothCircular(arr, win) {{
           if (win<=1) return arr.slice();
-          const n = arr.length;
-          const pad = Math.floor(win/2);
-          const out = new Float64Array(n);
+          const n = arr.length, pad = Math.floor(win/2), out = new Float64Array(n);
           let acc = 0;
-          // initialize window sum
           for (let k=-pad; k<=pad; k++) acc += arr[(k+n)%n];
           for (let i=0; i<n; i++) {{
             out[i] = acc / (2*pad+1);
-            // slide
-            const outIdx = (i-pad+n)%n;
-            const inIdx  = (i+pad+1)%n;
+            const outIdx = (i-pad+n)%n, inIdx = (i+pad+1)%n;
             acc += arr[inIdx] - arr[outIdx];
           }}
           return Array.from(out);
         }}
 
+        // working buffers
+        const x = new Float64Array(phi_grid.length);
+        const y = new Float64Array(phi_grid.length);
+
         // ----- Live update loop -----
         let lastTS = 0;
         function tick(ts) {{
-          // FPS throttle
-          if (!lastTS) lastTS = ts;
           const minDt = 1000/Math.max(10, TARGET_FPS);
+          if (!lastTS) lastTS = ts;
           if (ts - lastTS < minDt) {{ requestAnimationFrame(tick); return; }}
           lastTS = ts;
 
           if (!aud.paused) {{
-            analyser.getFloatFrequencyData(freqData); // dB values (negative)
+            analyser.getFloatFrequencyData(freqData); // dBFS negatives
+
+            // --- ACCUMULATE POWER onto phi bins ---
             const energy = new Float64Array(phi_grid.length);
-            // Accumulate spectral energy onto phi bins
-            for (let bi=0; bi<bins; bi++) {{
+            for (let bi = 0; bi < bins; bi++) {{
               const db = freqData[bi];
               if (!isFinite(db) || db < PKDB) continue;
               const f = binFreq(bi);
-              if (f<FMIN || f>FMAX) continue;
-              const phi = Math.log2(f / A4);  // continuous
-              if (phi<-HALF || phi>=HALF) continue; // outside displayed span
-              const idx = Math.floor((phi + HALF) / (2*HALF) * phi_grid.length);
-              const clamped = Math.max(0, Math.min(phi_grid.length-1, idx));
-              // convert dB to linear magnitude
-              const mag = Math.pow(10, db/20);
-              energy[clamped] += mag;
+              if (f < FMIN || f > FMAX) continue;
+              const phi = Math.log2(f / A4);
+              if (phi < -HALF || phi >= HALF) continue;
+              const idx = Math.floor((phi + HALF) / (2 * HALF) * phi_grid.length);
+              const ii = Math.max(0, Math.min(phi_grid.length - 1, idx));
+              const pwr = Math.pow(10, db / 10);   // POWER domain
+              energy[ii] += pwr;
             }}
-            // normalize + smooth
-            let maxv = 0; for (let i=0;i<energy.length;i++) if (energy[i]>maxv) maxv=energy[i];
-            if (maxv>0) for (let i=0;i<energy.length;i++) energy[i] /= maxv;
-            const energySm = (SMOOTH>1) ? smoothCircular(Array.from(energy), SMOOTH) : Array.from(energy);
 
-            // r(t) = r_base + wiggle_gain * energySm
-            const x = new Float64Array(phi_grid.length);
-            const y = new Float64Array(phi_grid.length);
+            // --- ROBUST NORMALIZATION (median/p95) ---
+            const tmp = Array.from(energy).sort((a,b)=>a-b);
+            const q = (t)=> tmp[Math.max(0, Math.min(tmp.length-1, Math.floor(t*(tmp.length-1))))];
+            const med = q(0.5), p95 = q(0.95);
+            let scale = p95 - med; if (scale <= 1e-12) scale = 1e-12;
+            for (let i=0;i<energy.length;i++) energy[i] = (energy[i] - med) / scale;
+
+            // --- GAMMA ---
+            const GAM = RIP_GAM;
+            if (Math.abs(GAM - 1.0) > 1e-6) {{
+              for (let i=0;i<energy.length;i++) {{
+                const s = Math.sign(energy[i]), a = Math.abs(energy[i]);
+                energy[i] = s * Math.pow(a, GAM);
+              }}
+            }}
+
+            // --- SMOOTH ---
+            const energySm = (SMOOTH > 1) ? smoothCircular(Array.from(energy), SMOOTH) : Array.from(energy);
+
+            // --- ZERO-CENTER ---
+            let mean = 0; for (let i=0;i<energySm.length;i++) mean += energySm[i];
+            mean /= energySm.length;
+            for (let i=0;i<energySm.length;i++) energySm[i] -= mean;
+
+            // --- AUTO-GAIN + CAP ---
+            let rms = 0; for (let i=0;i<energySm.length;i++) rms += energySm[i]*energySm[i];
+            rms = Math.sqrt(rms / energySm.length);
+            let gain = (rms > 1e-9) ? (RIP_TGT / rms) : 0.0;
+            gain *= Math.max(0.0, WGAIN);
+            const RCLAMP = Math.max(0.01, RIP_MAX);
+
+            // coords
             for (let i=0;i<phi_grid.length;i++) {{
-              const r = r_base[i] + WGAIN * energySm[i];
+              const dr = Math.max(-RCLAMP, Math.min(RCLAMP, gain * energySm[i]));
+              const r = r_base[i] + dr;
               x[i] = r * Math.cos(theta[i]);
               y[i] = r * Math.sin(theta[i]);
             }}
 
-            // update segment traces only (no redraw of guides)
+            // update only the colored segments
             const updateX = [], updateY = [], idxs = [];
             for (let s=0; s<seg_idx.length; s++) {{
               const [i0, j0] = seg_idx[s];
@@ -414,7 +436,7 @@ if uploaded is not None:
         }}
         requestAnimationFrame(tick);
 
-        // UI buttons (resume audio context if needed)
+        // Buttons (resume AudioContext if needed)
         document.getElementById('play').addEventListener('click', async () => {{
           try {{ if (AC.state === 'suspended') await AC.resume(); aud.play(); }} catch(e){{ console.error(e); }}
         }});
@@ -422,6 +444,6 @@ if uploaded is not None:
       </script>
     </body>
     </html>
-    """, height=700)
+    """, height=720)
 else:
-    st.info("Upload audio to see the TRUE spiral updating from the audio **in real time**.")
+    st.info("Upload audio to see a realtime, colored spiral with controllable ripples.")
